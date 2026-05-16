@@ -3,12 +3,13 @@
    ─────────────────────────────────────────────────────────────────
    Cambios respecto a Rev. H:
      · Sub-moods en IDLE que rotan automaticamente:
-         · IDLE_NORMAL   — ojos abiertos, mira aleatoria
-         · IDLE_BORED    — parpado caido (tipo OLED SLEEPY),
-                           mira fija ligeramente abajo
-         · IDLE_THINKING — ojos squint, mira arriba-derecha
+         · IDLE_NORMAL   — ojos abiertos
+         · IDLE_BORED    — parpado superior caido (SLEEPY del OLED)
+         · IDLE_THINKING — parpado inferior subido (HAPPY del OLED),
+                           ojos en forma de arco ^^ mirando arriba
        Rotacion cada 6-12 s; solo activo cuando mood >= 30
        (con mood bajo se mantiene la cara sad-brow sin cambios).
+       La mirada random sigue activa en todos los sub-moods.
    ════════════════════════════════════════════════════════════════ */
 
 #define LGFX_USE_V1
@@ -648,16 +649,17 @@ void drawBoredEye(int x, int y, int w, int h, uint16_t color) {
   canvas.fillRect(x - 4, y - 4, w + 8, lidH + 4, BG);
 }
 
-// ── ojo THINKING: squint (achicar verticalmente y centrar) ──
+// ── ojo THINKING: inverso del BORED, tapa la mitad INFERIOR ──
 //
-// La mirada arriba-derecha la maneja updateEyeLook(), aqui solo
-// reducimos la altura para que el ojo se vea "pensando".
+// Equivalente al HAPPY del codigo OLED (^^). Dibujamos el rounded
+// rect completo y tapamos el 50% de abajo. Se queda visible el top
+// redondeado: el ojo se ve como un arco mirando hacia arriba, ideal
+// para expresion de "pensando".
 //
 void drawThinkingEye(int x, int y, int w, int h, uint16_t color) {
-  int newH = (int)(h * 0.55f);
-  int newY = y + (h - newH) / 2;
-  int newR = EYE_R - 4; if (newR < 4) newR = 4;
-  canvas.fillRoundRect(x, newY, w, newH, newR, color);
+  canvas.fillRoundRect(x, y, w, h, EYE_R, color);
+  int lidH = (int)(h * 0.50f);
+  canvas.fillRect(x - 4, y + h - lidH, w + 8, lidH + 4, BG);
 }
 
 // ── ojo SAD llorando (usado SOLO por drawSadFace) ──
