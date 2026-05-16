@@ -1,22 +1,14 @@
 /* ════════════════════════════════════════════════════════════════
-   DESKTOP COMPANION — Rev. G
+   DESKTOP COMPANION — Rev. I
    ─────────────────────────────────────────────────────────────────
-   Cambios respecto a Rev. F:
-     · Sin icono de mood — el ánimo se refleja en los ojos del IDLE:
-         · mood ≥ 60 → ojos achatados estilo "sonrisa con cachetes"
-         · mood 30–59 → ojos blancos normales (rounded rect)
-         · mood < 30 → ojos azul oscuro medio cerrados, caídos
-     · Estado SAD rediseñado (estilo hámster triste):
-         · Ojos azul oscuro con reflejo vertical blanco
-         · Lágrima MÁS GRANDE saliendo del borde EXTERIOR
-     · Estado RAGE: SAD + 3 toques de cabeza → modo furia
-         · Ojos rojos muy grandes y angulados
-         · Persiste hasta que el mood sube
-     · Estado FED_UP: 3+ toques rápidos en mejilla → "ya fue suficiente"
-         · Ojos pequeños entrecerrados (mirada fija)
-         · Animación de mano con arma subiendo desde abajo
-     · Corazón con cálculo de tangente RUNTIME (V continuo)
-       y punta más profunda (tipY = 2.4 R) → V más sharp
+   Cambios respecto a Rev. H:
+     · Sub-moods en IDLE que rotan automaticamente:
+         · IDLE_NORMAL   — ojos abiertos, mira aleatoria
+         · IDLE_BORED    — parpado caido (tipo OLED SLEEPY),
+                           mira fija ligeramente abajo
+         · IDLE_THINKING — ojos squint, mira arriba-derecha
+       Rotacion cada 6-12 s; solo activo cuando mood >= 30
+       (con mood bajo se mantiene la cara sad-brow sin cambios).
    ════════════════════════════════════════════════════════════════ */
 
 #define LGFX_USE_V1
@@ -37,6 +29,8 @@ struct EyeShape {
   int      closedH;
 };
 
+bool transitionDone();
+
 // ═══════════════ 1) PINES ═════════════════════════════════════
 #define PIN_DISP_SCK     8
 #define PIN_DISP_MOSI    10
@@ -47,20 +41,20 @@ struct EyeShape {
 #define PIN_TOUCH_HEAD   4
 #define PIN_TOUCH_CHEEK  5
 #define PIN_AUDIO        3
-#define PIN_BATTERY      11      // GPIO11 (ADC2_CH0) — divisor 200k/100k
+#define PIN_BATTERY      11
 
 // ═══════════════ 2) COLORES ═══════════════════════════════════
 #define BG            0x0000
 #define EYE_WHITE     0xFFFF
 #define EYE_BLUE      0x041F
 #define EYE_RED       0xF800
-#define EYE_DARK_BLUE 0x10B5     // azul oscuro para SAD idle
-#define EYE_RAGE_RED  0xF801     // rojo intenso para RAGE
+#define EYE_DARK_BLUE 0x10B5
+#define EYE_RAGE_RED  0xF801
 #define HEART         0xF9CC
 #define CHEEK_SOFT    0x4082
 #define ZZZ           0x8410
 #define TEAR          0x4C9F
-#define BAT_LOW_RED   0xF800     // batería descargada (icono)
+#define BAT_LOW_RED   0xF800
 #define ARM_GRAY      0x6B6D
 #define HAND_LIGHT    0xC638
 #define GUN_DARK      0x2104
@@ -94,7 +88,6 @@ LGFX_Sprite canvas(&tft);
 enum State { S_IDLE, S_HAPPY, S_LOVE, S_SURPRISED, S_ANNOYED,
              S_SLEEPY, S_SAD, S_RAGE, S_FED_UP };
 
-// Estados "especiales" — usan render custom, no la lerp de EyeShape
 inline bool isSpecial(State s) {
   return s == S_SAD || s == S_RAGE || s == S_FED_UP;
 }
@@ -103,7 +96,7 @@ State    currentState   = S_SLEEPY;
 uint32_t stateEnterTime = 0;
 uint32_t lastInteractMs = 0;
 
-const uint32_t DUR_HAPPY     = 3500;
+const uint32_t DUR_HAPPY     = 1200;          // <<< 1/3 de Rev. G (era 3500)
 const uint32_t DUR_LOVE      = 4000;
 const uint32_t DUR_SURPRISED = 2500;
 const uint32_t DUR_ANNOYED   = 3200;
@@ -124,11 +117,6 @@ const int MOOD_INTERACT_GAIN = +1;
 
 int prevMoodTier = -1;
 
-// ── Ventana SAD→RAGE ──
-// Cuando el bichito entra a SAD se marca el timestamp. Si dentro de
-// los siguientes RAGE_WINDOW_MS el usuario lo molesta (3 toques
-// rápidos en cabeza), pasa a RAGE en lugar de ANNOYED — incluso si
-// los toques pasaron primero por HAPPY.
 uint32_t       lastSadEnterMs = 0;
 const uint32_t RAGE_WINDOW_MS = 30UL * 1000UL;
 
@@ -155,8 +143,8 @@ const Note sndBloop[]  = {{180,60},{140,60},{110,80}};
 const Note sndHeart[]  = {{180,90},{0,60},{180,90}};
 const Note sndSad[]    = {{140,150},{120,170},{105,200},{95,260}};
 const Note sndWhimper[]= {{130,100},{115,120},{100,150}};
-const Note sndRage[]   = {{60,200},{50,200},{60,150},{45,250}};                 // gruñido grave largo
-const Note sndCock[]   = {{500,40},{0,30},{300,40},{0,30},{200,80}};            // sonido de "amartillar"
+const Note sndRage[]   = {{60,200},{50,200},{60,150},{45,250}};
+const Note sndCock[]   = {{500,40},{0,30},{300,40},{0,30},{200,80}};
 
 #define LEN(a) (sizeof(a)/sizeof((a)[0]))
 
@@ -183,23 +171,10 @@ void updateAudio() {
 }
 
 // ═══════════════ 6b) BATERÍA ═══════════════════════════════════
-//
-// Divisor de tensión 200kΩ / 100kΩ entre OUT+ del módulo y GND, con
-// el punto medio en GPIO11. La caída del divisor es:
-//   V_adc = V_bat · R2/(R1+R2) = V_bat / 3
-//
-// Convertimos ADC raw → voltaje del pin → multiplicamos por 3 para
-// recuperar V_bat. Promediamos 16 lecturas para reducir ruido.
-//
-// Umbrales (V_adc → V_bat):
-//   1.17 V → 3.51 V  → ~25% (umbral de "necesita carga")
-//   1.40 V → 4.20 V  → 100%
-//   1.00 V → 3.00 V  → corte del DW01
-//
-const float    BAT_DIVIDER_K       = 3.00f;     // (R1+R2)/R2 = 300k/100k
+const float    BAT_DIVIDER_K       = 3.00f;
 const float    BAT_VREF            = 3.30f;
-const float    BAT_LOW_VADC        = 1.17f;     // umbral "descargada"
-const uint32_t BAT_READ_INTERVAL   = 5000;      // 5 s
+const float    BAT_LOW_VADC        = 1.17f;
+const uint32_t BAT_READ_INTERVAL   = 5000;
 
 float    batteryVoltage = 4.0f;
 float    batteryVadc    = 1.33f;
@@ -217,9 +192,7 @@ void updateBattery() {
   batteryVadc    = (raw * BAT_VREF) / 4095.0f;
   batteryVoltage = batteryVadc * BAT_DIVIDER_K;
 
-  // Histéresis: pasa a "low" en 1.17, vuelve a "ok" recién en 1.22
-  // (≈3.66 V) para evitar parpadeo del icono cerca del umbral
-  if (!batteryLow && batteryVadc < BAT_LOW_VADC)        batteryLow = true;
+  if (!batteryLow && batteryVadc < BAT_LOW_VADC)             batteryLow = true;
   else if (batteryLow && batteryVadc > BAT_LOW_VADC + 0.05f) batteryLow = false;
 }
 
@@ -257,11 +230,68 @@ void checkIdle() {
   scheduleIdle();
 }
 
+// ═══════════════ 7b) EYE LOOK-AROUND (IDLE + HAPPY + SAD) ══════
+//
+// El bichito mira alrededor cuando esta en estados "que duran":
+// IDLE, HAPPY y SAD. Cada 1.5-4 s elige una direccion aleatoria
+// entre 5 opciones (centro, izq, der, arriba, abajo). El offset
+// se interpola 1 px por frame -> velocidad ~60 px/s (16 ms/frame).
+//
+int      lookOffX = 0, lookOffY = 0;
+int      lookTargetX = 0, lookTargetY = 0;
+uint32_t nextLookChangeAt = 0;
+
+// ── Sub-moods en IDLE: NORMAL / BORED / THINKING ──
+enum IdleMood { IDLE_NORMAL, IDLE_BORED, IDLE_THINKING };
+IdleMood currentIdleMood        = IDLE_NORMAL;
+uint32_t nextIdleMoodChangeAt   = 0;
+const uint32_t IDLE_MOOD_MIN_MS = 6000;
+const uint32_t IDLE_MOOD_MAX_MS = 12000;
+
+void updateEyeLook(uint32_t t) {
+  bool allowLook = (currentState == S_IDLE ||
+                    currentState == S_HAPPY ||
+                    currentState == S_SAD);
+
+  if (!allowLook) {
+    // Volver al centro suavemente al salir
+    lookTargetX = 0;
+    lookTargetY = 0;
+  } else if (t >= nextLookChangeAt && transitionDone()) {
+    // Mirada random en todos los sub-moods (la forma cambia, no la mirada)
+    const int dirs[5][2] = {{0,0}, {-12,0}, {12,0}, {0,-8}, {0,8}};
+    int p = random(0, 5);
+    lookTargetX = dirs[p][0];
+    lookTargetY = dirs[p][1];
+    nextLookChangeAt = t + random(1500, 4000);
+  }
+
+  if      (lookOffX < lookTargetX) lookOffX++;
+  else if (lookOffX > lookTargetX) lookOffX--;
+  if      (lookOffY < lookTargetY) lookOffY++;
+  else if (lookOffY > lookTargetY) lookOffY--;
+}
+
+// ═══════════════ 7c) IDLE SUB-MOODS rotation ═══════════════════
+//
+// Cada IDLE_MOOD_MIN..MAX ms, en IDLE estable con mood >= 30,
+// elige al azar entre NORMAL/BORED/THINKING (sin repetir el actual).
+// Si mood < 30 no rota: se mantiene la cara sad-brow.
+//
+void updateIdleSubMood(uint32_t t) {
+  if (currentState != S_IDLE || !transitionDone() || moodLevel < 30) return;
+  if (t < nextIdleMoodChangeAt) return;
+
+  IdleMood nm;
+  do { nm = (IdleMood)random(0, 3); } while (nm == currentIdleMood);
+  currentIdleMood = nm;
+  nextIdleMoodChangeAt = t + random(IDLE_MOOD_MIN_MS, IDLE_MOOD_MAX_MS);
+
+  const char* names[] = {"NORMAL", "BORED", "THINKING"};
+  Serial.printf("[idle] sub-mood -> %s\n", names[(int)currentIdleMood]);
+}
+
 // ═══════════════ 8) EYE SHAPE por estado ═══════════════════════
-//
-// IDLE depende del mood (se calcula al pedir la shape).
-// Estados especiales (SAD/RAGE/FED_UP) tienen render dedicado.
-//
 EyeShape stateShape(State s) {
   EyeShape e;
   e.rectW=60; e.rectH=80; e.xOffset=0; e.yOffset=0;
@@ -269,21 +299,23 @@ EyeShape stateShape(State s) {
 
   switch (s) {
     case S_IDLE:
-      if (moodLevel >= 60) {                     // contento — mismo tamaño, con mordida
+      if (moodLevel >= 60) {
         e.rectW = 60; e.rectH = 80;
-      } else if (moodLevel >= 30) {              // normal
+      } else if (moodLevel >= 30) {
         e.rectW = 60; e.rectH = 80;
-      } else {                                   // triste — rectangular pequeño
-        e.rectW = 50; e.rectH = 32; e.yOffset = 12; e.color = EYE_DARK_BLUE;
+      } else {
+        // sad sin llorar: dimensiones normales, color azul oscuro,
+        // se renderiza con cejas / \ (estilo OLED SUSPECT)
+        e.rectW = 60; e.rectH = 80; e.color = EYE_DARK_BLUE;
       }
       break;
     case S_HAPPY:     e.rectH = 22;                                         break;
     case S_SURPRISED: e.rectW = 72; e.rectH = 100; e.color = EYE_BLUE;      break;
-    case S_ANNOYED:   e.rectH = 50; e.slope = 28; e.color = EYE_RED;        break;
+    case S_ANNOYED:   e.rectH = 60; e.slope = 22; e.color = EYE_RED;        break;
     case S_LOVE:      e.rectW = 0; e.rectH = 0; e.heartR = 18;              break;
     case S_SLEEPY:    e.rectW = 0; e.rectH = 0;
                       e.closedW = 70; e.closedH = 26; e.yOffset = -8;       break;
-    default: break;     // SAD/RAGE/FED_UP no usan EyeShape
+    default: break;
   }
   return e;
 }
@@ -329,13 +361,11 @@ void setState(State s) {
   bool nowSp = isSpecial(s);
 
   if (wasSp || nowSp) {
-    // SNAP — sin morph para estados especiales
     targetEyes      = stateShape(s);
     currentEyes     = targetEyes;
     prevEyes        = targetEyes;
     transitionStart = millis() - TRANS_DURATION;
   } else {
-    // Morph normal
     prevEyes        = currentEyes;
     targetEyes      = stateShape(s);
     transitionStart = millis();
@@ -344,6 +374,12 @@ void setState(State s) {
   currentState   = s;
   stateEnterTime = millis();
   lastInteractMs = millis();
+
+  // Reset del sub-mood al entrar a IDLE
+  if (s == S_IDLE) {
+    currentIdleMood      = IDLE_NORMAL;
+    nextIdleMoodChangeAt = millis() + random(5000, 9000);
+  }
 
   switch (s) {
     case S_HAPPY:     playSeq(sndChirp, LEN(sndChirp)); changeMood(MOOD_HAPPY_GAIN);   break;
@@ -374,7 +410,7 @@ void updateStateTimeouts() {
       if (moodLevel >= 30) setState(S_IDLE);
       break;
     case S_RAGE:
-      if (moodLevel >= 50) setState(S_IDLE);    // sale cuando mood se recupera
+      if (moodLevel >= 50) setState(S_IDLE);
       break;
     case S_SLEEPY: break;
     default: break;
@@ -382,10 +418,6 @@ void updateStateTimeouts() {
 }
 
 // ═══════════════ 12) IDLE SHAPE refresh por mood ═══════════════
-//
-// Si el mood cruza un tier mientras estamos en IDLE, hacemos morph
-// suave hacia la nueva shape de IDLE.
-//
 void refreshIdleShape() {
   int tier = moodTier(moodLevel);
   if (tier != prevMoodTier && currentState == S_IDLE && transitionDone()) {
@@ -421,12 +453,11 @@ void handleTouch() {
     bool rapid = isRapidArr(headTouchTimes, now);
 
     if (rapid) {
-      // Si pasamos por SAD en los últimos RAGE_WINDOW_MS → RAGE
       bool recentlySad = lastSadEnterMs > 0 &&
                          (millis() - lastSadEnterMs) < RAGE_WINDOW_MS;
       if (recentlySad) {
         setState(S_RAGE);
-        lastSadEnterMs = 0;                  // se "consume"
+        lastSadEnterMs = 0;
       } else {
         setState(S_ANNOYED);
       }
@@ -444,10 +475,9 @@ void handleTouch() {
     bool rapid = isRapidArr(cheekTouchTimes, now);
 
     if (rapid) {
-      setState(S_FED_UP);                 // 3 toques rápidos en mejilla → "ya fue suficiente"
+      setState(S_FED_UP);
       cheekTouchTimes[0] = cheekTouchTimes[1] = cheekTouchTimes[2] = 0;
     } else if (currentState == S_RAGE) {
-      // Caricia para calmar el RAGE
       setState(S_LOVE);
       changeMood(MOOD_LOVE_GAIN);
     } else {
@@ -488,21 +518,14 @@ const int CX = 120, CY = 120;
 const int EYE_GAP   = 30;
 const int EYE_R     = 18;
 const int EYE_W_REF = 60;
-const int EYE_CENTER_LEFT  = CX - EYE_GAP/2 - EYE_W_REF/2;   // 75
-const int EYE_CENTER_RIGHT = CX + EYE_GAP/2 + EYE_W_REF/2;   // 165
+const int EYE_CENTER_LEFT  = CX - EYE_GAP/2 - EYE_W_REF/2;
+const int EYE_CENTER_RIGHT = CX + EYE_GAP/2 + EYE_W_REF/2;
 
 inline int eyeLeftX(int w)  { return CX - EYE_GAP/2 - w; }
 inline int eyeRightX()      { return CX + EYE_GAP/2; }
 inline int eyeTopY(int h)   { return CY - h/2; }
 
 // ═══════════════ 16) PRIMITIVAS ════════════════════════════════
-//
-// CORAZÓN — V calculada en runtime con el teorema del tangente.
-// El triángulo arranca exactamente donde el lóbulo lo "deja", sin
-// step visible. Punta en cy + 2.4·R → V más sharp que antes.
-//
-//   Tangencia: |C-P_T| ⊥ (P - P_T) donde P es el ápice.
-//
 void drawHeartBig(int cx, int cy, int R, uint16_t color) {
   if (R < 2) return;
   int lobeOffX = (int)(R * 0.65f);
@@ -520,7 +543,7 @@ void drawHeartBig(int cx, int cy, int R, uint16_t color) {
 
   float beta     = atan2f(vy, vx);
   float angleOff = acosf(Rf / d);
-  float alpha    = beta + angleOff;       // tangente exterior
+  float alpha    = beta + angleOff;
 
   int LxRel = (int)(Rf * cosf(alpha));
   int LyRel = (int)(Rf * sinf(alpha));
@@ -531,7 +554,6 @@ void drawHeartBig(int cx, int cy, int R, uint16_t color) {
   canvas.fillTriangle(baseLX, baseY, baseRX, baseY, cx, tipY, color);
 }
 
-// ── ojo cerrado en U ──
 void drawClosedEyeU(int cx, int yTop, int w, int depth, uint16_t color) {
   if (w < 4 || depth < 2) return;
   int rx = w/2, ry = depth;
@@ -539,7 +561,7 @@ void drawClosedEyeU(int cx, int yTop, int w, int depth, uint16_t color) {
   canvas.fillRect(cx - rx - 2, yTop - ry - 1, w + 4, ry + 1, BG);
 }
 
-// ── ojo angulado annoyed ──
+// ── ojo angulado tipo trapecio rojo (usado SOLO por drawRageFace) ──
 void drawAnnoyedEye(int xL, int yTop, int w, int h, int slope, bool isLeft, uint16_t color) {
   int xR = xL + w;
   int yTL, yTR;
@@ -550,32 +572,108 @@ void drawAnnoyedEye(int xL, int yTop, int w, int h, int slope, bool isLeft, uint
   canvas.fillTriangle(xL, yTL, xR, yB,  xL, yB, color);
 }
 
-// ── ojo HAPPY idle: mismo tamaño que el normal + mordida circular
-//    en la esquina inferior EXTERIOR (simula cachete subiendo).
+// ── ojo ANNOYED v2: rounded rect + ceja \ / como el OLED ANGRY ──
 //
-//    Truco: rounded rect completo (60x80, igual al normal) + un
-//    fillCircle en BG sobre la esquina afuera-abajo. El cuarto del
-//    círculo que queda dentro del rect se vuelve negro, "comiéndose"
-//    la esquina.
+//   Left eye  -> cut esquina superior-derecha (interior)
+//   Right eye -> cut esquina superior-izquierda (interior)
 //
-void drawHappyEye(int x, int y, int w, int h, bool isLeft, uint16_t color) {
+// Profundidad del corte = slope; la animacion de squeeze que escala
+// el slope tambien anima la ceja.
+//
+void drawAnnoyedEyeV2(int x, int y, int w, int h, int slope, bool isLeft, uint16_t color) {
+  if (w < 4 || h < 4) return;
   canvas.fillRoundRect(x, y, w, h, EYE_R, color);
+  if (slope <= 0) return;
 
-  int biteR = 26;
-  if (isLeft) canvas.fillCircle(x,     y + h, biteR, BG);    // outer = izq → muerde bot-left
-  else        canvas.fillCircle(x + w, y + h, biteR, BG);    // outer = der → muerde bot-right
+  int cutDepth = slope;
+  if (isLeft) {
+    // Cut interior (esquina superior-derecha del ojo izquierdo)
+    canvas.fillTriangle(x - 4,     y - 4,
+                        x + w + 4, y - 4,
+                        x + w,     y + cutDepth, BG);
+  } else {
+    // Cut interior (esquina superior-izquierda del ojo derecho)
+    canvas.fillTriangle(x - 4,     y - 4,
+                        x + w + 4, y - 4,
+                        x,         y + cutDepth, BG);
+  }
 }
 
-// ── ojo SAD: redondo arriba, recto abajo ──
+// ── ojo SAD sin llorar: rounded rect + cejas / \ como OLED SUSPECT ──
+//
+// Cejas hacia AFUERA (caen las esquinas externas-superiores).
+// Es la expresion clasica de "cara de pena" (inner brows raised).
+//
+//   Left eye  -> cut esquina superior-izquierda (exterior)
+//   Right eye -> cut esquina superior-derecha (exterior)
+//
+void drawSadBrowEye(int x, int y, int w, int h, bool isLeft, uint16_t color) {
+  if (w < 4 || h < 4) return;
+  canvas.fillRoundRect(x, y, w, h, EYE_R, color);
+
+  int cutDepth = (int)(h * 0.28f);   // ~22 px en ojo de 80
+  if (cutDepth < 6) return;
+
+  if (isLeft) {
+    // Cut exterior (esquina superior-izquierda del ojo izquierdo)
+    canvas.fillTriangle(x - 4,     y - 4,
+                        x + w + 4, y - 4,
+                        x - 4,     y + cutDepth, BG);
+  } else {
+    // Cut exterior (esquina superior-derecha del ojo derecho)
+    canvas.fillTriangle(x - 4,     y - 4,
+                        x + w + 4, y - 4,
+                        x + w + 4, y + cutDepth, BG);
+  }
+}
+
+// ── ojo HAPPY idle: mordida circular en esquina inferior exterior ──
+void drawHappyEye(int x, int y, int w, int h, bool isLeft, uint16_t color) {
+  canvas.fillRoundRect(x, y, w, h, EYE_R, color);
+  int biteR = 26;
+  if (isLeft) canvas.fillCircle(x,     y + h, biteR, BG);
+  else        canvas.fillCircle(x + w, y + h, biteR, BG);
+}
+
+// ── ojo BORED: parpado caido tapando la mitad superior ──
+//
+// Se dibuja el rounded rect completo y luego se tapa el 50% de
+// arriba con un rect negro. El borde inferior se queda redondeado
+// (porque el fillRect solo cubre la parte superior), creando un
+// look de ojos entrecerrados de aburrimiento.
+//
+void drawBoredEye(int x, int y, int w, int h, uint16_t color) {
+  canvas.fillRoundRect(x, y, w, h, EYE_R, color);
+  int lidH = (int)(h * 0.50f);
+  canvas.fillRect(x - 4, y - 4, w + 8, lidH + 4, BG);
+}
+
+// ── ojo THINKING: squint (achicar verticalmente y centrar) ──
+//
+// La mirada arriba-derecha la maneja updateEyeLook(), aqui solo
+// reducimos la altura para que el ojo se vea "pensando".
+//
+void drawThinkingEye(int x, int y, int w, int h, uint16_t color) {
+  int newH = (int)(h * 0.55f);
+  int newY = y + (h - newH) / 2;
+  int newR = EYE_R - 4; if (newR < 4) newR = 4;
+  canvas.fillRoundRect(x, newY, w, newH, newR, color);
+}
+
+// ── ojo SAD llorando (usado SOLO por drawSadFace) ──
 void drawSadEye(int x, int y, int w, int h, uint16_t color) {
   int r = 10;
   canvas.fillRoundRect(x, y, w, h, r, color);
-  // tapar esquinas inferiores → bottom recto
   canvas.fillRect(x,         y + h - r, r, r, color);
   canvas.fillRect(x + w - r, y + h - r, r, r, color);
 }
 
 // ═══════════════ 17) DINÁMICAS ═════════════════════════════════
+//
+// lookOffX/Y se aplica aqui para IDLE y HAPPY.
+// Para S_SAD el offset se aplica directamente en drawSadFace
+// (estado especial, no pasa por este path).
+//
 void applyStateDynamics(EyeShape& e, uint32_t t) {
   uint32_t dt = t - stateEnterTime;
   switch (currentState) {
@@ -587,10 +685,18 @@ void applyStateDynamics(EyeShape& e, uint32_t t) {
       else                  openness = 1.0f;
       int targetH = targetEyes.rectH;
       e.rectH = 4 + (int)((targetH - 4) * openness);
+      e.xOffset += lookOffX;
+      e.yOffset += lookOffY;
       break;
     }
-    case S_HAPPY: e.yOffset += (int)(sinf(t * 0.012f) * 2.0f); break;
-    case S_SURPRISED: e.rectH += (int)(sinf((float)dt * 0.022f) * 2.0f); break;
+    case S_HAPPY:
+      e.yOffset += (int)(sinf(t * 0.012f) * 2.0f);
+      e.xOffset += lookOffX;
+      e.yOffset += lookOffY;
+      break;
+    case S_SURPRISED:
+      e.rectH += (int)(sinf((float)dt * 0.022f) * 2.0f);
+      break;
     case S_ANNOYED: {
       float squeeze = 0.55f + 0.45f * (sinf((float)t * 0.018f) + 1.0f) * 0.5f;
       e.rectH = (int)(targetEyes.rectH * squeeze);
@@ -614,43 +720,37 @@ void applyStateDynamics(EyeShape& e, uint32_t t) {
 
 // ═══════════════ 18) RENDERS ESPECIALES ════════════════════════
 
-// ── SAD: ojos rectangulares pequeños, redondos arriba / rectos abajo ──
-//
-// El ojo tiene:
-//   · Cuerpo azul oscuro
-//   · Charco celeste en la parte inferior (lágrimas acumuladas)
-//   · Una gota cayendo solo del ojo DERECHO
+// ── SAD llorando: ojos azul oscuro + charco + lagrima cayendo ──
+// Aplica lookOffX/Y para que mire alrededor. El charco sigue al ojo;
+// la lagrima cae desde la posicion actual del ojo derecho.
 //
 void drawSadFace(uint32_t t) {
   int w = 50, h = 32;
-  int yT = CY - h/2 + 12;
+  int yT = CY - h/2 + 12 + lookOffY;
+  int xL = eyeLeftX(w) + lookOffX;
+  int xR = eyeRightX() + lookOffX;
 
-  // Ojos
-  drawSadEye(eyeLeftX(w),  yT, w, h, EYE_DARK_BLUE);
-  drawSadEye(eyeRightX(),  yT, w, h, EYE_DARK_BLUE);
+  drawSadEye(xL, yT, w, h, EYE_DARK_BLUE);
+  drawSadEye(xR, yT, w, h, EYE_DARK_BLUE);
 
-  // Charco de lágrimas dentro de cada ojo (parte inferior)
-  // Onda sutil en la superficie usando seno → ilusión de líquido
   int poolH = 10;
   int waveY = yT + h - poolH + (int)(sinf((float)t * 0.004f) * 1.0f);
-  canvas.fillRect(eyeLeftX(w) + 2,  waveY, w - 4, poolH - 2, TEAR);
-  canvas.fillRect(eyeRightX() + 2,  waveY, w - 4, poolH - 2, TEAR);
+  canvas.fillRect(xL + 2, waveY, w - 4, poolH - 2, TEAR);
+  canvas.fillRect(xR + 2, waveY, w - 4, poolH - 2, TEAR);
 
-  // Lágrima desbordando solo desde el ojo DERECHO
   uint32_t cycle = t % 2800;
   if (cycle < 1900) {
-    float p  = (float)cycle / 1900.0f;
-    int dy   = (int)(p * 75.0f);
-    int xR   = eyeRightX() + w - 8;
-    int yR   = yT + h + dy;
-    canvas.fillCircle(xR, yR, 5, TEAR);
-    canvas.fillTriangle(xR - 5, yR, xR + 5, yR, xR, yR - 12, TEAR);
+    float p     = (float)cycle / 1900.0f;
+    int   dy    = (int)(p * 75.0f);
+    int   xTear = xR + w - 8;
+    int   yTear = yT + h + dy;
+    canvas.fillCircle(xTear, yTear, 5, TEAR);
+    canvas.fillTriangle(xTear - 5, yTear, xTear + 5, yTear, xTear, yTear - 12, TEAR);
   }
 }
 
-// ── RAGE: ojos rojos enormes y angulados, vibración fuerte ───
+// ── RAGE ──
 void drawRageFace(uint32_t t) {
-  uint32_t dt = t - stateEnterTime;
   int shakeX = (int)(sinf((float)t * 0.060f) * 5.0f);
   int shakeY = (int)(cosf((float)t * 0.075f) * 3.0f);
 
@@ -660,7 +760,6 @@ void drawRageFace(uint32_t t) {
   drawAnnoyedEye(eyeLeftX(w) + shakeX, yTop, w, h, slope, true,  EYE_RAGE_RED);
   drawAnnoyedEye(eyeRightX() + shakeX, yTop, w, h, slope, false, EYE_RAGE_RED);
 
-  // Cejas extra arriba (ceño bestial)
   canvas.fillTriangle(eyeLeftX(w) + shakeX,        yTop - 8 + shakeY,
                       eyeLeftX(w) + shakeX + w,    yTop + slope - 8 + shakeY,
                       eyeLeftX(w) + shakeX + w/2,  yTop - 18 + shakeY, EYE_RAGE_RED);
@@ -668,7 +767,6 @@ void drawRageFace(uint32_t t) {
                       eyeRightX() + shakeX + w,    yTop - 8 + shakeY,
                       eyeRightX() + shakeX + w/2,  yTop - 18 + shakeY, EYE_RAGE_RED);
 
-  // Pulso en los ojos — pequeñas pupilas blancas pulsantes
   float pulse = 1.0f + sinf((float)t * 0.025f) * 0.3f;
   int pR = (int)(4 * pulse);
   if (pR > 1) {
@@ -677,65 +775,30 @@ void drawRageFace(uint32_t t) {
   }
 }
 
-// ── helpers para dibujar rotado ───────────────────────────────
-static inline int rotPx(int cx, int dx, int dy, float ca, float sa) {
-  return cx + (int)(dx * ca - dy * sa);
-}
-static inline int rotPy(int cy, int dx, int dy, float ca, float sa) {
-  return cy + (int)(dx * sa + dy * ca);
-}
-// rect rotado alrededor de (cx, cy) — definido en coords locales (x1,y1)-(x2,y2)
-static void fillRotRect(int cx, int cy, int x1, int y1, int x2, int y2,
-                        float ca, float sa, uint16_t color) {
-  int ax  = rotPx(cx, x1, y1, ca, sa), ay  = rotPy(cy, x1, y1, ca, sa);
-  int bx_ = rotPx(cx, x2, y1, ca, sa), by_ = rotPy(cy, x2, y1, ca, sa);
-  int cx_ = rotPx(cx, x2, y2, ca, sa), cy_ = rotPy(cy, x2, y2, ca, sa);
-  int dx_ = rotPx(cx, x1, y2, ca, sa), dy_ = rotPy(cy, x1, y2, ca, sa);
-  canvas.fillTriangle(ax, ay, bx_, by_, cx_, cy_, color);
-  canvas.fillTriangle(ax, ay, cx_, cy_, dx_, dy_, color);
-}
-
-// ── FED_UP: "Ya fue suficiente" — ojos pequeños + arma frontal ──
-//
-// Animación de la mano con arma subiendo desde abajo:
-// - 0 a 900 ms: arma sube de y=240 hasta y=145 (ease-out)
-// - >900 ms: queda apuntando, mira fija
-//
+// ── FED_UP ──
 void drawFedUpFace(uint32_t t) {
   uint32_t dt = t - stateEnterTime;
 
-  // Ojos pequeños entrecerrados
   int eyeH = 10, eyeW = 50;
   int yTop = CY - eyeH/2 - 22;
   canvas.fillRoundRect(eyeLeftX(eyeW), yTop, eyeW, eyeH, 5, EYE_WHITE);
   canvas.fillRoundRect(eyeRightX(),    yTop, eyeW, eyeH, 5, EYE_WHITE);
 
-  // Pupilas pequeñas mirando fijo (ligeramente abajo, hacia el arma)
   canvas.fillCircle(EYE_CENTER_LEFT  + 4, yTop + eyeH/2 + 1, 3, BG);
   canvas.fillCircle(EYE_CENTER_RIGHT - 4, yTop + eyeH/2 + 1, 3, BG);
 
-  // Mano + arma subiendo desde abajo
   float p = dt < 900 ? (float)dt / 900.0f : 1.0f;
-  p = 1.0f - powf(1.0f - p, 2.5f);                  // ease-out
+  p = 1.0f - powf(1.0f - p, 2.5f);
 
   int gunStart = 240;
   int gunEnd   = 145;
   int gY = gunStart - (int)((gunStart - gunEnd) * p);
 
-  // Brazo (gris, vertical)
   canvas.fillRect(CX - 7, gY + 35, 14, 240 - (gY + 35), ARM_GRAY);
-
-  // Mano (un poco más clara)
   canvas.fillRoundRect(CX - 10, gY + 25, 20, 14, 3, HAND_LIGHT);
-
-  // Cuerpo del arma
   canvas.fillRoundRect(CX - 9, gY + 8, 18, 20, 2, GUN_DARK);
-
-  // Cañón apuntando arriba
   canvas.fillRect(CX - 4, gY - 5, 8, 14, GUN_DARK);
-  canvas.fillCircle(CX, gY - 5, 2, BG);             // boquilla del cañón
-
-  // Gatillo y guardamonte (detalle)
+  canvas.fillCircle(CX, gY - 5, 2, BG);
   canvas.drawCircle(CX, gY + 28, 5, GUN_DARK);
 }
 
@@ -755,20 +818,27 @@ void drawShape(const EyeShape& s) {
     int xR = eyeRightX()       + s.xOffset;
     int yT = eyeTopY(s.rectH)  + s.yOffset;
 
-    // Selección de estilo según estado IDLE + mood (después del morph)
     bool inIdleSettled = (currentState == S_IDLE && transitionDone());
     bool styleHappy    = inIdleSettled && moodLevel >= 60;
     bool styleSad      = inIdleSettled && moodLevel < 30;
+    bool styleBored    = inIdleSettled && moodLevel >= 30 && currentIdleMood == IDLE_BORED;
+    bool styleThinking = inIdleSettled && moodLevel >= 30 && currentIdleMood == IDLE_THINKING;
 
     if (s.slope > 0) {
-      drawAnnoyedEye(xL, yT, s.rectW, s.rectH, s.slope, true,  s.color);
-      drawAnnoyedEye(xR, yT, s.rectW, s.rectH, s.slope, false, s.color);
+      drawAnnoyedEyeV2(xL, yT, s.rectW, s.rectH, s.slope, true,  s.color);
+      drawAnnoyedEyeV2(xR, yT, s.rectW, s.rectH, s.slope, false, s.color);
+    } else if (styleSad) {
+      drawSadBrowEye(xL, yT, s.rectW, s.rectH, true,  s.color);
+      drawSadBrowEye(xR, yT, s.rectW, s.rectH, false, s.color);
+    } else if (styleBored) {
+      drawBoredEye(xL, yT, s.rectW, s.rectH, s.color);
+      drawBoredEye(xR, yT, s.rectW, s.rectH, s.color);
+    } else if (styleThinking) {
+      drawThinkingEye(xL, yT, s.rectW, s.rectH, s.color);
+      drawThinkingEye(xR, yT, s.rectW, s.rectH, s.color);
     } else if (styleHappy) {
       drawHappyEye(xL, yT, s.rectW, s.rectH, true,  s.color);
       drawHappyEye(xR, yT, s.rectW, s.rectH, false, s.color);
-    } else if (styleSad) {
-      drawSadEye(xL, yT, s.rectW, s.rectH, s.color);
-      drawSadEye(xR, yT, s.rectW, s.rectH, s.color);
     } else {
       canvas.fillRoundRect(xL, yT, s.rectW, s.rectH, EYE_R, s.color);
       canvas.fillRoundRect(xR, yT, s.rectW, s.rectH, EYE_R, s.color);
@@ -776,37 +846,22 @@ void drawShape(const EyeShape& s) {
   }
 }
 
-// ── icono de batería baja (rojo) ──
-//
-// Posicionado a la derecha de la cara en IDLE. Forma estilizada:
-// un rectángulo redondeado con un terminal pequeño a la derecha,
-// relleno rojo y un símbolo "!" interno para indicar el aviso.
-// Pulsación sutil (alpha) para llamar la atención sin molestar.
-//
+// ── icono de bateria baja ──
 void drawLowBatteryIcon(int x, int y, uint32_t t) {
   int w = 22, h = 12;
-
-  // Pulso sutil: parpadea suave con período ~1.5 s
   float blink = 0.6f + 0.4f * (sinf((float)t * 0.004f) + 1.0f) * 0.5f;
   uint16_t col = lerpColor565(BG, BAT_LOW_RED, blink);
-
-  // Cuerpo
   canvas.drawRoundRect(x, y, w, h, 2, col);
   canvas.fillRoundRect(x + 2, y + 2, w - 4, h - 4, 1, col);
-  // Terminal positivo
   canvas.fillRect(x + w, y + 4, 2, h - 8, col);
-
-  // Símbolo "!" en el centro (huecos en BG sobre el rojo)
   int cxIco = x + w / 2;
-  canvas.fillRect(cxIco, y + 3,  1, 4, BG);
-  canvas.fillRect(cxIco, y + 8,  1, 1, BG);
+  canvas.fillRect(cxIco, y + 3, 1, 4, BG);
+  canvas.fillRect(cxIco, y + 8, 1, 1, BG);
 }
 
 void drawStateExtras(uint32_t t) {
   if (!transitionDone()) return;
 
-  // Icono de batería baja: solo en IDLE, posicionado a la derecha
-  // de la cara (dentro del círculo de la pantalla circular)
   if (currentState == S_IDLE && batteryLow) {
     drawLowBatteryIcon(180, CY - 6, t);
   }
@@ -821,7 +876,7 @@ void drawStateExtras(uint32_t t) {
       int      base  = CY - 50 - (int)phase * 5;
       canvas.setTextColor(ZZZ);
       canvas.setTextSize(2);
-      canvas.setCursor(CX + 50, base);     canvas.print("z");
+      canvas.setCursor(CX + 50, base);      canvas.print("z");
       canvas.setCursor(CX + 60, base - 14); canvas.print("z");
       canvas.setCursor(CX + 70, base - 28); canvas.print("Z");
       break;
@@ -834,16 +889,14 @@ void renderFace() {
   uint32_t t = millis();
   canvas.fillSprite(BG);
 
-  // Estados especiales: render dedicado
   if (isSpecial(currentState)) {
     switch (currentState) {
-      case S_SAD:    drawSadFace(t);    break;
-      case S_RAGE:   drawRageFace(t);   break;
-      case S_FED_UP: drawFedUpFace(t);  break;
+      case S_SAD:    drawSadFace(t);   break;
+      case S_RAGE:   drawRageFace(t);  break;
+      case S_FED_UP: drawFedUpFace(t); break;
       default: break;
     }
   } else {
-    // Estados normales: morph + dynamics + extras
     float p = transitionProgressEased();
     currentEyes = lerpShape(prevEyes, targetEyes, p);
     if (transitionDone()) applyStateDynamics(currentEyes, t);
@@ -858,7 +911,7 @@ void renderFace() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n[Companion rev.G] init");
+  Serial.println("\n[Companion rev.H] init");
 
   tft.init();
   tft.setRotation(0);
@@ -882,10 +935,11 @@ void setup() {
   lastInteractMs  = millis();
 
   scheduleIdle();
-  lastMoodDecayMs = millis();
-  prevMoodTier    = moodTier(moodLevel);
+  lastMoodDecayMs  = millis();
+  prevMoodTier     = moodTier(moodLevel);
+  nextLookChangeAt = millis() + 1500;
 
-  Serial.println("[Companion rev.G] ready — sleeping");
+  Serial.println("[Companion rev.H] ready — sleeping");
 }
 
 void loop() {
@@ -894,6 +948,8 @@ void loop() {
   updateAudio();
   updateMood();
   updateBattery();
+  updateEyeLook(millis());      // mirada random en IDLE/HAPPY/SAD
+  updateIdleSubMood(millis());  // rota NORMAL/BORED/THINKING en IDLE
   refreshIdleShape();
   updateStateTimeouts();
   checkIdle();
