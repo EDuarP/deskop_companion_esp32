@@ -102,7 +102,7 @@ const uint32_t DUR_LOVE      = 4000;
 const uint32_t DUR_SURPRISED = 2500;
 const uint32_t DUR_ANNOYED   = 3200;
 const uint32_t DUR_FED_UP    = 6000;
-const uint32_t IDLE_TO_SLEEP = 5UL * 60UL * 1000UL;
+const uint32_t IDLE_TO_SLEEP = 30UL * 60UL * 1000UL;
 
 // ═══════════════ 5) MOOD ═══════════════════════════════════════
 int       moodLevel       = 80;
@@ -174,7 +174,7 @@ void updateAudio() {
 // ═══════════════ 6b) BATERÍA ═══════════════════════════════════
 const float    BAT_DIVIDER_K       = 3.00f;
 const float    BAT_VREF            = 3.30f;
-const float    BAT_LOW_VADC        = 1.17f;
+const float    BAT_LOW_VADC        = 1.00f;
 const uint32_t BAT_READ_INTERVAL   = 5000;
 
 float    batteryVoltage = 4.0f;
@@ -313,7 +313,7 @@ EyeShape stateShape(State s) {
     case S_HAPPY:     e.rectH = 22;                                         break;
     case S_SURPRISED: e.rectW = 72; e.rectH = 100; e.color = EYE_BLUE;      break;
     case S_ANNOYED:   e.rectH = 60; e.slope = 22; e.color = EYE_RED;        break;
-    case S_LOVE:      e.rectW = 0; e.rectH = 0; e.heartR = 18;              break;
+    case S_LOVE:      e.rectW = 0; e.rectH = 0; e.heartR = 24;              break;
     case S_SLEEPY:    e.rectW = 0; e.rectH = 0;
                       e.closedW = 70; e.closedH = 26; e.yOffset = -8;       break;
     default: break;
@@ -529,9 +529,9 @@ inline int eyeTopY(int h)   { return CY - h/2; }
 // ═══════════════ 16) PRIMITIVAS ════════════════════════════════
 void drawHeartBig(int cx, int cy, int R, uint16_t color) {
   if (R < 2) return;
-  int lobeOffX = (int)(R * 0.65f);
-  int lobeY    = cy - (int)(R * 0.30f);
-  int tipY     = cy + (int)(R * 2.4f);
+  int lobeOffX = (int)(R * 0.70f);
+  int lobeY    = cy - (int)(R * 0.35f);
+  int tipY     = cy + (int)(R * 1.80f);
 
   canvas.fillCircle(cx - lobeOffX, lobeY, R, color);
   canvas.fillCircle(cx + lobeOffX, lobeY, R, color);
@@ -709,13 +709,33 @@ void applyStateDynamics(EyeShape& e, uint32_t t) {
       break;
     }
     case S_LOVE: {
-      float pulse = 1.0f + sinf((float)t * 0.012f) * 0.10f;
+      // Latido lub-dub: dos pulsos rapidos + reposo. Crece hasta +30%.
+      uint32_t cyc = t % 1000;
+      float p;
+      if      (cyc <  80) p = (float)cyc / 80.0f;                       // lub (sube)
+      else if (cyc < 200) p = 1.0f - (float)(cyc -  80) / 120.0f;       // lub (baja)
+      else if (cyc < 280) p = 0.55f * (float)(cyc - 200) / 80.0f;       // dub (sube)
+      else if (cyc < 420) p = 0.55f * (1.0f - (float)(cyc - 280) / 140.0f); // dub (baja)
+      else                p = 0.0f;                                      // reposo
+      float pulse = 1.0f + p * 0.30f;
       e.heartR = (int)(targetEyes.heartR * pulse);
       break;
     }
-    case S_SLEEPY:
+    case S_SLEEPY: {
       e.closedH = targetEyes.closedH + (int)(sinf((float)t * 0.0015f) * 2.0f);
+      // Cabeceo tipo "se te cae la cabeza del sueno":
+      // 0..3400 ms cae lento de 0 a +14 px; 3400..4000 ms regresa rapido.
+      uint32_t nodCycle = t % 4000;
+      int nodOff;
+      if (nodCycle < 3400) {
+        nodOff = (int)((float)nodCycle / 3400.0f * 14.0f);
+      } else {
+        float p = (float)(nodCycle - 3400) / 600.0f;
+        nodOff = (int)(14.0f * (1.0f - p));
+      }
+      e.yOffset += nodOff;
       break;
+    }
     default: break;
   }
 }
