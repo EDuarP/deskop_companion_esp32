@@ -15,6 +15,11 @@
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 #include <math.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include "secrets.h"
+#define WEATHER_PERIOD   (10UL * 60UL * 1000UL)
 
 // ─── Forward declarations ─────────────────────────────────────
 struct Note     { uint16_t freq; uint16_t ms; };
@@ -31,6 +36,9 @@ struct EyeShape {
 };
 
 bool transitionDone();
+
+// Forward decl: shared con la seccion TOOLS, usada por handleTouch.
+extern uint32_t consumeTouchesUntil;
 
 // ═══════════════ 1) PINES ═════════════════════════════════════
 #define PIN_DISP_SCK     8
@@ -59,6 +67,16 @@ bool transitionDone();
 #define ARM_GRAY      0x6B6D
 #define HAND_LIGHT    0xC638
 #define GUN_DARK      0x2104
+
+// ── Paleta para modo TOOLS ──
+#define TL_FG       0xFFFF
+#define TL_DIM      0x630C
+#define TL_DIM2     0x4208
+#define TL_ACCENT   0x05FF
+#define TL_ACCENT2  0xFD20
+#define TL_WARN     0xF800
+#define TL_OK       0x07E0
+#define TL_GOLD     0xFEA0
 
 // ═══════════════ 3) DRIVER ═════════════════════════════════════
 class LGFX : public lgfx::LGFX_Device {
@@ -457,6 +475,9 @@ bool isRapidArr(uint32_t arr[3], uint32_t now) {
 void handleTouch() {
   bool h = digitalRead(PIN_TOUCH_HEAD)  == HIGH;
   bool c = digitalRead(PIN_TOUCH_CHEEK) == HIGH;
+
+  // Durante consume window (toggle de app mode), actualiza prev sin actuar.
+  if (millis() < consumeTouchesUntil) { prevHead = h; prevCheek = c; return; }
 
   // En ENOJADO: cabeza y mejilla cuentan como caricias para calmar. N total.
   if (currentState == S_ANGRY) {
@@ -960,11 +981,528 @@ void renderFace() {
   canvas.pushSprite(0, 0);
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//   ───────── MODO TOOLS: reloj digital + clima + info ─────────
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Centro del display (alias para legibilidad en tools) ──
+constexpr int TLCX = 120, TLCY = 120;
+
+// ── Paginas ──
+enum ToolPage { PG_CLOCK, PG_WEATHER, PG_INFO, PG_COUNT };
+ToolPage currentPage = PG_CLOCK;
+int      pressFlashUntil = 0;
+
+// ── Botones (page nav, mismos pines que touch) ──
+bool prevRight = false, prevLeft = false;
+uint32_t lastBtnMs = 0;
+const uint32_t BTN_DEBOUNCE = 150;
+
+// ── App mode toggle (consume window compartido) ──
+uint32_t consumeTouchesUntil = 0;
+
+// ── WiFi + NTP ──
+bool     wifiOnline  = false;
+bool     timeSynced  = false;
+uint32_t wifiRetryAt = 0;
+
+void wifiInit() {
+  if (String(WIFI_SSID) == "YOUR_WIFI") return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(100);
+  wifiOnline = (WiFi.status() == WL_CONNECTED);
+  if (wifiOnline) {
+    configTime(TZ_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
+    struct tm ti;
+    if (getLocalTime(&ti, 5000)) timeSynced = true;
+  }
+}
+
+void wifiKeepAlive() {
+  if (String(WIFI_SSID) == "YOUR_WIFI") return;
+  if (WiFi.status() == WL_CONNECTED) { wifiOnline = true; return; }
+  wifiOnline = false;
+  if (millis() < wifiRetryAt) return;
+  WiFi.reconnect();
+  wifiRetryAt = millis() + 15000;
+}
+
+// ── Clima ──
+struct WeatherData {
+  float    tempC      = NAN;
+  float    feelsC     = NAN;
+  float    tempMinC   = NAN;
+  float    tempMaxC   = NAN;
+  int      humidity   = -1;
+  float    windMs     = NAN;
+  String   cond       = "";
+  String   desc       = "";
+  uint32_t lastUpdate = 0;
+};
+WeatherData wx;
+int      wxLastHttpCode = 0;
+uint32_t wxRetryAt      = 0;
+
+static float jsonNum(const String& j, const String& key) {
+  String pat = "\"" + key + "\":";
+  int idx = j.indexOf(pat);
+  if (idx < 0) return NAN;
+  idx += pat.length();
+  int end = idx;
+  while (end < (int)j.length() && (isDigit(j[end]) || j[end]=='.' || j[end]=='-')) end++;
+  if (end == idx) return NAN;
+  return j.substring(idx, end).toFloat();
+}
+static String jsonStr(const String& j, const String& key) {
+  String pat = "\"" + key + "\":\"";
+  int idx = j.indexOf(pat);
+  if (idx < 0) return "";
+  idx += pat.length();
+  int end = j.indexOf("\"", idx);
+  if (end < 0) return "";
+  return j.substring(idx, end);
+}
+
+void fetchWeather() {
+  if (!wifiOnline) return;
+  if (String(OWM_API_KEY) == "YOUR_OPENWEATHER_KEY") return;
+  uint32_t now = millis();
+  if (wx.lastUpdate != 0 && now - wx.lastUpdate < WEATHER_PERIOD) return;
+  if (now < wxRetryAt) return;
+
+  HTTPClient http;
+  String url = String("http://api.openweathermap.org/data/2.5/weather?q=")
+             + OWM_CITY + "&appid=" + OWM_API_KEY + "&units=metric&lang=es";
+  http.begin(url);
+  http.setTimeout(5000);
+  int code = http.GET();
+  wxLastHttpCode = code;
+  Serial.printf("[wx] GET -> %d\n", code);
+  if (code == 200) {
+    String body = http.getString();
+    wx.tempC    = jsonNum(body, "temp");
+    wx.feelsC   = jsonNum(body, "feels_like");
+    wx.tempMinC = jsonNum(body, "temp_min");
+    wx.tempMaxC = jsonNum(body, "temp_max");
+    wx.humidity = (int)jsonNum(body, "humidity");
+    wx.windMs   = jsonNum(body, "speed");
+    wx.cond     = jsonStr(body, "main");
+    wx.desc     = jsonStr(body, "description");
+    wx.lastUpdate = now;
+  } else {
+    wxRetryAt = now + (code < 0 ? 30000 : 300000);
+  }
+  http.end();
+}
+
+// ── Helpers geometria / sprite ──
+inline void tlPolar(int cx, int cy, float r, float angDeg, int& x, int& y) {
+  float a = (angDeg - 90.0f) * DEG_TO_RAD;
+  x = cx + (int)(r * cosf(a));
+  y = cy + (int)(r * sinf(a));
+}
+
+inline void tlPx(int x, int y, int n, uint16_t c) { canvas.fillRect(x, y, n, n, c); }
+
+void drawSaturn(int cx, int cy, int bodyR) {
+  const uint16_t body = TL_GOLD;
+  const uint16_t ring = 0xD69A;
+  int rx = bodyR + 7;
+  int ry = (bodyR / 2) + 1;
+  for (int a = 180; a <= 360; a += 4) {
+    float rad = a * DEG_TO_RAD;
+    int x = cx + (int)(rx * cosf(rad));
+    int y = cy + (int)(ry * sinf(rad));
+    canvas.fillCircle(x, y, 1, ring);
+  }
+  canvas.fillCircle(cx, cy, bodyR, body);
+  for (int a = 0; a <= 180; a += 4) {
+    float rad = a * DEG_TO_RAD;
+    int x = cx + (int)(rx * cosf(rad));
+    int y = cy + (int)(ry * sinf(rad));
+    canvas.fillCircle(x, y, 1, ring);
+  }
+}
+
+void drawPixelSprite(int cx, int cy, int blk,
+                     const char* const* lines, int rows, int cols,
+                     const uint16_t* palette) {
+  int x0 = cx - (cols * blk) / 2;
+  int y0 = cy - (rows * blk) / 2;
+  for (int y = 0; y < rows; y++) {
+    for (int x = 0; x < cols; x++) {
+      char c = lines[y][x];
+      if (c == '.') continue;
+      int idx;
+      if      (c >= '0' && c <= '9') idx = c - '0';
+      else if (c >= 'A' && c <= 'F') idx = 10 + c - 'A';
+      else continue;
+      canvas.fillRect(x0 + x * blk, y0 + y * blk, blk, blk, palette[idx]);
+    }
+  }
+}
+
+// ── Sprites del clima ──
+static const uint16_t CLOUD_PAL[4] = { 0xC618, 0xFFFF, 0x8410, 0x4208 };
+static const char* CLOUD16[] = {
+  "....11111.......",
+  "..1100000011....",
+  ".100000000001...",
+  "100000000000001.",
+  "1000000000000001",
+  ".0000000000000..",
+  ".2222222222222..",
+  "..3333333333....",
+};
+static const uint16_t SUN_PAL[3] = { 0xFEA0, 0xFFE5, 0xFB60 };
+static const char* SUN_SPR[] = {
+  "....111....",
+  "..1100022..",
+  ".110000222.",
+  ".100000022.",
+  "10000000022",
+  "10000000022",
+  "10000000022",
+  ".100000022.",
+  ".000000022.",
+  "..0000022..",
+  "....222....",
+};
+static const uint16_t DROP_PAL[3] = { 0x05FF, 0xFFFF, 0x0017 };
+static const char* DROP_SPR[] = { ".1.", "10.", "002", ".2." };
+static const uint16_t SNOW_PAL[2] = { 0xFFFF, 0xD7FF };
+static const char* SNOW_SPR[] = { ".0.", "010", ".0." };
+static const uint16_t BOLT_PAL[3] = { 0xFFE0, 0xFFFF, 0xFB60 };
+static const char* BOLT_SPR[] = {
+  "..11.", ".110.", "11000", ".0000", "..120", "...12", "....2"
+};
+
+void drawWeatherIcon(int cx, int cy, const String& cond, uint32_t t) {
+  if (cond == "Clear") {
+    drawPixelSprite(cx, cy, 4, SUN_SPR, 11, 11, SUN_PAL);
+    const uint16_t r = TL_GOLD;
+    tlPx(cx - 2, cy - 28, 4, r);
+    tlPx(cx - 2, cy + 24, 4, r);
+    tlPx(cx - 28, cy - 2, 4, r);
+    tlPx(cx + 24, cy - 2, 4, r);
+  } else if (cond == "Clouds" || cond == "Mist" || cond == "Fog" || cond == "Haze") {
+    int drift = (int)(sinf(t * 0.001f) * 4.0f);
+    drawPixelSprite(cx + drift, cy, 4, CLOUD16, 8, 16, CLOUD_PAL);
+  } else if (cond == "Rain" || cond == "Drizzle") {
+    drawPixelSprite(cx, cy - 6, 4, CLOUD16, 8, 16, CLOUD_PAL);
+    for (int i = 0; i < 4; i++) {
+      int x = cx - 16 + i * 11;
+      int yOff = ((int)(t / 70) + i * 5) % 22;
+      drawPixelSprite(x, cy + 22 + yOff, 3, DROP_SPR, 4, 3, DROP_PAL);
+    }
+  } else if (cond == "Snow") {
+    drawPixelSprite(cx, cy - 6, 4, CLOUD16, 8, 16, CLOUD_PAL);
+    for (int i = 0; i < 4; i++) {
+      int x = cx - 18 + i * 12;
+      int yOff = ((int)(t / 80) + i * 6) % 22;
+      drawPixelSprite(x, cy + 22 + yOff, 3, SNOW_SPR, 3, 3, SNOW_PAL);
+    }
+  } else if (cond == "Thunderstorm") {
+    static const uint16_t STORM_PAL[4] = { 0x8410, 0xC618, 0x4208, 0x2104 };
+    drawPixelSprite(cx, cy - 8, 4, CLOUD16, 8, 16, STORM_PAL);
+    drawPixelSprite(cx, cy + 22, 4, BOLT_SPR, 7, 5, BOLT_PAL);
+  } else {
+    canvas.drawRect(cx - 14, cy - 14, 28, 28, TL_DIM);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(TL_DIM);
+    canvas.setTextDatum(middle_center);
+    canvas.setTextSize(2);
+    canvas.drawString("?", cx, cy);
+  }
+}
+
+// ── Page renderers ──
+void drawClockPage(uint32_t t) {
+  struct tm ti;
+  bool gotTime = timeSynced && getLocalTime(&ti, 0);
+
+  int hh = 0, mm = 0;
+  int dow = -1, dd = 0, mo = 0, yr = 0;
+  if (gotTime) {
+    hh = ti.tm_hour; mm = ti.tm_min;
+    dow = ti.tm_wday; dd = ti.tm_mday; mo = ti.tm_mon + 1; yr = ti.tm_year + 1900;
+  } else {
+    uint32_t s = t / 1000;
+    hh = (s / 3600) % 24; mm = (s / 60) % 60;
+  }
+
+  // Decoracion astronomica: orbita + estrellas + luna creciente
+  for (int a = 0; a < 360; a += 9) {
+    int x, y; tlPolar(TLCX, TLCY, 117, a, x, y);
+    canvas.fillCircle(x, y, 1, TL_DIM2);
+  }
+  static const int starsAng[] = { 22, 48, 72, 108, 152, 198, 248, 292, 332 };
+  static const int starsR[]   = {108,113,105,110,112,107,109,113,106 };
+  static const int starsB[]   = {  2,  1,  2,  1,  2,  1,  2,  1,  2 };
+  for (int i = 0; i < 9; i++) {
+    int x, y; tlPolar(TLCX, TLCY, starsR[i], starsAng[i], x, y);
+    uint16_t col = starsB[i] == 2 ? TL_FG : TL_DIM;
+    canvas.fillCircle(x, y, starsB[i], col);
+    if (starsB[i] == 2) {
+      canvas.drawPixel(x - 2, y, TL_DIM);
+      canvas.drawPixel(x + 2, y, TL_DIM);
+      canvas.drawPixel(x, y - 2, TL_DIM);
+      canvas.drawPixel(x, y + 2, TL_DIM);
+    }
+  }
+  int mx = TLCX, my = TLCY - 95;
+  canvas.fillCircle(mx, my, 8, TL_FG);
+  canvas.fillCircle(mx + 4, my - 1, 8, BG);
+
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextSize(1);
+  canvas.setTextColor(TL_DIM);
+  canvas.setTextDatum(middle_center);
+  canvas.drawString("TIME", TLCX, TLCY - 42);
+
+  canvas.setTextSize(5);
+  canvas.setTextColor(TL_FG);
+  bool colon = (t % 1000) < 500;
+  char hm[8]; snprintf(hm, sizeof(hm), "%02d%c%02d", hh, colon ? ':' : ' ', mm);
+  canvas.drawString(hm, TLCX, TLCY - 12);
+  canvas.setTextSize(1);
+
+  canvas.setTextColor(TL_DIM);
+  canvas.drawString("DATE", TLCX, TLCY + 16);
+
+  canvas.setTextColor(TL_GOLD);
+  if (gotTime) {
+    const char* dias[] = {"DOM","LUN","MAR","MIE","JUE","VIE","SAB"};
+    char buf[24]; snprintf(buf, sizeof(buf), "%s %02d-%02d-%d", dias[dow], dd, mo, yr);
+    canvas.drawString(buf, TLCX, TLCY + 30);
+  } else {
+    canvas.setTextColor(TL_WARN);
+    canvas.drawString("SIN NTP", TLCX, TLCY + 30);
+  }
+
+  if (!isnan(wx.tempC)) {
+    canvas.setTextColor(TL_ACCENT);
+    char buf[12]; snprintf(buf, sizeof(buf), "%.0fC", wx.tempC);
+    canvas.drawString(buf, TLCX, TLCY + 50);
+  }
+
+  drawSaturn(TLCX, TLCY + 76, 8);
+}
+
+void drawWeatherPage(uint32_t t) {
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextSize(1);
+  for (int i = 0; i < 12; i++) {
+    float a = i * 30.0f;
+    int x0, y0, x1, y1;
+    tlPolar(TLCX, TLCY, 112, a, x0, y0);
+    tlPolar(TLCX, TLCY, 118, a, x1, y1);
+    canvas.drawWideLine(x0, y0, x1, y1, 1, TL_DIM2);
+  }
+
+  if (isnan(wx.tempC)) {
+    canvas.setTextDatum(middle_center);
+    canvas.setTextSize(1);
+    if (!wifiOnline)                  { canvas.setTextColor(TL_WARN); canvas.drawString("SIN WIFI",             TLCX, TLCY - 12); }
+    else if (wxLastHttpCode == 0)     { canvas.setTextColor(TL_DIM);  canvas.drawString("Cargando clima...",    TLCX, TLCY - 12); }
+    else if (wxLastHttpCode == 401)   { canvas.setTextColor(TL_WARN); canvas.drawString("API KEY INVALIDA",     TLCX, TLCY - 12); }
+    else if (wxLastHttpCode == 404)   { canvas.setTextColor(TL_WARN); canvas.drawString("CIUDAD NO ENCONTRADA", TLCX, TLCY - 12); }
+    else {
+      canvas.setTextColor(TL_WARN);
+      char eb[32]; snprintf(eb, sizeof(eb), "HTTP ERROR %d", wxLastHttpCode);
+      canvas.drawString(eb, TLCX, TLCY - 12);
+    }
+    canvas.setTextColor(TL_DIM2);
+    canvas.drawString(OWM_CITY, TLCX, TLCY + 12);
+    return;
+  }
+
+  canvas.setTextColor(TL_DIM);
+  canvas.setTextSize(1);
+  canvas.setTextDatum(middle_center);
+  canvas.drawString(OWM_CITY, TLCX, TLCY - 78);
+
+  drawWeatherIcon(TLCX - 56, TLCY - 18, wx.cond, t);
+
+  canvas.setTextColor(TL_FG);
+  canvas.setTextSize(4);
+  canvas.setTextDatum(middle_right);
+  char tbuf[12]; snprintf(tbuf, sizeof(tbuf), "%.0fC", wx.tempC);
+  canvas.drawString(tbuf, TLCX + 56, TLCY - 18);
+
+  canvas.setTextColor(TL_ACCENT);
+  canvas.setTextSize(1);
+  canvas.setTextDatum(middle_center);
+  String desc = wx.desc; desc.toUpperCase();
+  canvas.drawString(desc, TLCX, TLCY + 18);
+
+  float range = wx.tempMaxC - wx.tempMinC;
+  if (range < 0.5f) range = 0.5f;
+  float pos = (wx.tempC - wx.tempMinC) / range;
+  if (pos < 0) pos = 0; if (pos > 1) pos = 1;
+  int barX = TLCX - 60, barY = TLCY + 38, barW = 120;
+  canvas.drawRoundRect(barX, barY, barW, 6, 3, TL_DIM2);
+  canvas.fillRect(barX + (int)(pos * barW) - 1, barY - 2, 3, 10, TL_ACCENT);
+  canvas.setTextColor(TL_DIM);
+  canvas.setTextDatum(top_left);
+  char b1[8]; snprintf(b1, sizeof(b1), "%.0f", wx.tempMinC);
+  canvas.drawString(b1, barX - 4, barY + 10);
+  canvas.setTextDatum(top_right);
+  char b2[8]; snprintf(b2, sizeof(b2), "%.0f", wx.tempMaxC);
+  canvas.drawString(b2, barX + barW + 4, barY + 10);
+
+  canvas.setTextColor(TL_DIM);
+  canvas.setTextDatum(middle_center);
+  canvas.setTextSize(1);
+  char hbuf[12]; snprintf(hbuf, sizeof(hbuf), "%d%% HUM", wx.humidity);
+  canvas.drawString(hbuf, TLCX - 36, TLCY + 72);
+  char wbuf[16]; snprintf(wbuf, sizeof(wbuf), "%.1f m/s", wx.windMs);
+  canvas.drawString(wbuf, TLCX + 36, TLCY + 72);
+}
+
+void drawWifiBars(int cx, int cy, int rssi) {
+  int bars = 0;
+  if      (rssi >= -55) bars = 5;
+  else if (rssi >= -65) bars = 4;
+  else if (rssi >= -75) bars = 3;
+  else if (rssi >= -85) bars = 2;
+  else if (rssi != 0)   bars = 1;
+  for (int i = 0; i < 5; i++) {
+    int x = cx - 18 + i * 9;
+    int h = 4 + i * 4;
+    uint16_t col = (i < bars) ? TL_ACCENT : TL_DIM2;
+    canvas.fillRect(x, cy + 12 - h, 6, h, col);
+  }
+}
+
+void drawInfoPage(uint32_t t) {
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextDatum(middle_center);
+  canvas.setTextSize(2);
+  canvas.setTextColor(TL_FG);
+  canvas.drawString("SYSTEM", TLCX, TLCY - 92);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(TL_DIM);
+  canvas.drawString("WIFI", TLCX, TLCY - 68);
+  drawWifiBars(TLCX, TLCY - 50, wifiOnline ? WiFi.RSSI() : 0);
+
+  canvas.setTextColor(wifiOnline ? TL_OK : TL_WARN);
+  canvas.drawString(wifiOnline ? WiFi.SSID() : "OFFLINE", TLCX, TLCY - 22);
+  if (wifiOnline) {
+    canvas.setTextColor(TL_DIM);
+    canvas.drawString(WiFi.localIP().toString(), TLCX, TLCY - 8);
+  }
+
+  uint32_t s = t / 1000;
+  uint32_t h = s / 3600, m = (s / 60) % 60, sec = s % 60;
+  char ub[24]; snprintf(ub, sizeof(ub), "UP %02lu:%02lu:%02lu",
+                       (unsigned long)h, (unsigned long)m, (unsigned long)sec);
+  canvas.setTextColor(TL_ACCENT);
+  canvas.drawString(ub, TLCX, TLCY + 18);
+
+  char hb[24]; snprintf(hb, sizeof(hb), "HEAP %lu KB",
+                       (unsigned long)(ESP.getFreeHeap() / 1024));
+  canvas.setTextColor(TL_DIM);
+  canvas.drawString(hb, TLCX, TLCY + 36);
+
+  canvas.setTextColor(TL_DIM2);
+  canvas.drawString("< MEJILLA   CABEZA >", TLCX, TLCY + 70);
+}
+
+void drawPageDots() {
+  int gap = 10;
+  int totalW = (PG_COUNT - 1) * gap;
+  int x0 = TLCX - totalW / 2;
+  int y  = 220;
+  bool flashing = millis() < (uint32_t)pressFlashUntil;
+  for (int i = 0; i < PG_COUNT; i++) {
+    int x = x0 + i * gap;
+    bool active = (i == (int)currentPage);
+    uint16_t col = active ? TL_FG : TL_DIM2;
+    if (flashing && active) col = TL_ACCENT;
+    canvas.fillCircle(x, y, active ? 3 : 2, col);
+  }
+}
+
+void changePage(int dir) {
+  int n = (int)currentPage + dir;
+  if (n < 0) n = PG_COUNT - 1;
+  if (n >= PG_COUNT) n = 0;
+  currentPage = (ToolPage)n;
+  pressFlashUntil = millis() + 250;
+}
+
+void handleButtonsTools() {
+  if (millis() < consumeTouchesUntil) {
+    prevRight = digitalRead(PIN_TOUCH_HEAD)  == HIGH;
+    prevLeft  = digitalRead(PIN_TOUCH_CHEEK) == HIGH;
+    return;
+  }
+  uint32_t now = millis();
+  bool r = digitalRead(PIN_TOUCH_HEAD)  == HIGH;  // cabeza = derecha
+  bool l = digitalRead(PIN_TOUCH_CHEEK) == HIGH;  // mejilla = izquierda
+  if (now - lastBtnMs > BTN_DEBOUNCE) {
+    if (r && !prevRight) { changePage(+1); lastBtnMs = now; }
+    if (l && !prevLeft)  { changePage(-1); lastBtnMs = now; }
+  }
+  prevRight = r; prevLeft = l;
+}
+
+void renderToolsFrame() {
+  uint32_t t = millis();
+  canvas.fillSprite(BG);
+  switch (currentPage) {
+    case PG_CLOCK:    drawClockPage(t);    break;
+    case PG_WEATHER:  drawWeatherPage(t);  break;
+    case PG_INFO:     drawInfoPage(t);     break;
+    default: break;
+  }
+  drawPageDots();
+  canvas.pushSprite(0, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//   ───────── APP MODE TOGGLE (presionar ambos pulsadores) ─────────
+// ═══════════════════════════════════════════════════════════════════
+enum AppMode { APP_COMPANION, APP_TOOLS };
+AppMode currentApp = APP_COMPANION;
+uint32_t bothPressedSince = 0;
+const uint32_t APP_TOGGLE_HOLD_MS = 700;
+const uint32_t APP_CONSUME_MS     = 1500;
+
+// Devuelve true si el toggle se acaba de disparar en este tick.
+bool detectAppToggle() {
+  uint32_t now = millis();
+  bool h = digitalRead(PIN_TOUCH_HEAD)  == HIGH;
+  bool c = digitalRead(PIN_TOUCH_CHEEK) == HIGH;
+  if (h && c) {
+    if (bothPressedSince == 0) bothPressedSince = now;
+    if (now - bothPressedSince > APP_TOGGLE_HOLD_MS && now >= consumeTouchesUntil) {
+      currentApp = (currentApp == APP_COMPANION) ? APP_TOOLS : APP_COMPANION;
+      bothPressedSince = 0;
+      consumeTouchesUntil = now + APP_CONSUME_MS;
+      Serial.printf("[app] -> %s\n", currentApp == APP_COMPANION ? "COMPANION" : "TOOLS");
+      // Reset estado de touches para evitar disparos al soltar
+      prevHead = prevCheek = true;
+      prevRight = prevLeft = true;
+      // Si entras a TOOLS y no hay WiFi todavia, intenta conectar
+      if (currentApp == APP_TOOLS && !wifiOnline) wifiInit();
+      return true;
+    }
+  } else {
+    bothPressedSince = 0;
+  }
+  return false;
+}
+
 // ═══════════════ 20) SETUP & LOOP ══════════════════════════════
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n[Companion rev.H] init");
+  Serial.println("\n[Companion+Tools] init");
 
   tft.init();
   tft.setRotation(0);
@@ -992,20 +1530,34 @@ void setup() {
   prevMoodTier     = moodTier(moodLevel);
   nextLookChangeAt = millis() + 1500;
 
-  Serial.println("[Companion rev.H] ready — sleeping");
+  // WiFi se conecta on-demand al entrar en modo TOOLS la primera vez.
+  Serial.println("[Companion+Tools] ready — modo COMPANION");
 }
 
 void loop() {
-  handleTouch();
-  handleMic();
-  updateAudio();
-  updateMood();
-  updateBattery();
-  updateEyeLook(millis());      // mirada random en IDLE/HAPPY/SAD
-  updateIdleSubMood(millis());  // rota NORMAL/BORED/THINKING en IDLE
-  refreshIdleShape();
-  updateStateTimeouts();
-  checkIdle();
-  renderFace();
-  delay(16);
+  // Toggle por doble-press
+  detectAppToggle();
+
+  if (currentApp == APP_COMPANION) {
+    // Companion: handleTouch respeta consumeTouchesUntil
+    handleTouch();
+    handleMic();
+    updateAudio();
+    updateMood();
+    updateBattery();
+    updateEyeLook(millis());
+    updateIdleSubMood(millis());
+    refreshIdleShape();
+    updateStateTimeouts();
+    checkIdle();
+    renderFace();
+  } else {
+    // Tools mode
+    handleButtonsTools();
+    wifiKeepAlive();
+    fetchWeather();
+    renderToolsFrame();
+  }
+  delay(33);
 }
+

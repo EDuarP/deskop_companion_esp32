@@ -1,0 +1,5 @@
+tools_desktop/secrets.h
+deskop_companion/secrets.h
+*.swp
+.DS_Store
+build/
