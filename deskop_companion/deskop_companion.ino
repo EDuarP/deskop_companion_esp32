@@ -87,7 +87,7 @@ LGFX_Sprite canvas(&tft);
 
 // ═══════════════ 4) ESTADOS ════════════════════════════════════
 enum State { S_IDLE, S_HAPPY, S_LOVE, S_SURPRISED, S_ANNOYED,
-             S_SLEEPY, S_SAD, S_RAGE, S_FED_UP };
+             S_SLEEPY, S_SAD, S_RAGE, S_FED_UP, S_ANGRY };
 
 inline bool isSpecial(State s) {
   return s == S_SAD || s == S_RAGE || s == S_FED_UP;
@@ -102,6 +102,8 @@ const uint32_t DUR_LOVE      = 4000;
 const uint32_t DUR_SURPRISED = 2500;
 const uint32_t DUR_ANNOYED   = 3200;
 const uint32_t DUR_FED_UP    = 6000;
+const uint32_t DUR_RAGE      = 5000;
+const int      ANGRY_CALM_TOUCHES = 3;
 const uint32_t IDLE_TO_SLEEP = 30UL * 60UL * 1000UL;
 
 // ═══════════════ 5) MOOD ═══════════════════════════════════════
@@ -243,7 +245,7 @@ int      lookTargetX = 0, lookTargetY = 0;
 uint32_t nextLookChangeAt = 0;
 
 // ── Sub-moods en IDLE: NORMAL / BORED / THINKING ──
-enum IdleMood { IDLE_NORMAL, IDLE_BORED, IDLE_THINKING };
+enum IdleMood { IDLE_NORMAL, IDLE_BORED };
 IdleMood currentIdleMood        = IDLE_NORMAL;
 uint32_t nextIdleMoodChangeAt   = 0;
 const uint32_t IDLE_MOOD_MIN_MS = 6000;
@@ -252,7 +254,8 @@ const uint32_t IDLE_MOOD_MAX_MS = 12000;
 void updateEyeLook(uint32_t t) {
   bool allowLook = (currentState == S_IDLE ||
                     currentState == S_HAPPY ||
-                    currentState == S_SAD);
+                    currentState == S_SAD  ||
+                    currentState == S_ANGRY);
 
   if (!allowLook) {
     // Volver al centro suavemente al salir
@@ -280,15 +283,17 @@ void updateEyeLook(uint32_t t) {
 // Si mood < 30 no rota: se mantiene la cara sad-brow.
 //
 void updateIdleSubMood(uint32_t t) {
-  if (currentState != S_IDLE || !transitionDone() || moodLevel < 30) return;
+  if (currentState != S_IDLE || !transitionDone()) return;
+  // Solo rota sub-moods en tier MEDIO (mood 30-59). En happy/sad usa el estilo fijo del tier.
+  if (moodLevel < 30 || moodLevel >= 60) { currentIdleMood = IDLE_NORMAL; return; }
   if (t < nextIdleMoodChangeAt) return;
 
   IdleMood nm;
-  do { nm = (IdleMood)random(0, 3); } while (nm == currentIdleMood);
+  do { nm = (IdleMood)random(0, 2); } while (nm == currentIdleMood);
   currentIdleMood = nm;
   nextIdleMoodChangeAt = t + random(IDLE_MOOD_MIN_MS, IDLE_MOOD_MAX_MS);
 
-  const char* names[] = {"NORMAL", "BORED", "THINKING"};
+  const char* names[] = {"NORMAL", "BORED"};
   Serial.printf("[idle] sub-mood -> %s\n", names[(int)currentIdleMood]);
 }
 
@@ -312,7 +317,8 @@ EyeShape stateShape(State s) {
       break;
     case S_HAPPY:     e.rectH = 22;                                         break;
     case S_SURPRISED: e.rectW = 72; e.rectH = 100; e.color = EYE_BLUE;      break;
-    case S_ANNOYED:   e.rectH = 60; e.slope = 22; e.color = EYE_RED;        break;
+    case S_ANNOYED:   e.rectH = 80; e.slope = 22; e.color = EYE_RED;        break;
+    case S_ANGRY:     e.rectW = 60; e.rectH = 80; e.slope = 22; e.color = EYE_RED; break;
     case S_LOVE:      e.rectW = 0; e.rectH = 0; e.heartR = 24;              break;
     case S_SLEEPY:    e.rectW = 0; e.rectH = 0;
                       e.closedW = 70; e.closedH = 26; e.yOffset = -8;       break;
@@ -411,7 +417,11 @@ void updateStateTimeouts() {
       if (moodLevel >= 30) setState(S_IDLE);
       break;
     case S_RAGE:
-      if (moodLevel >= 50) setState(S_IDLE);
+      // Si no se calma en DUR_RAGE pasa a ENOJADO sostenido.
+      if (elapsed > DUR_RAGE) setState(S_ANGRY);
+      break;
+    case S_ANGRY:
+      // Solo sale con ANGRY_CALM_TOUCHES caricias (handleTouch).
       break;
     case S_SLEEPY: break;
     default: break;
@@ -432,6 +442,7 @@ void refreshIdleShape() {
 // ═══════════════ 13) TOUCH ═════════════════════════════════════
 bool prevHead  = false;
 bool prevCheek = false;
+int  angryCalmCount = 0;
 uint32_t headTouchTimes[3]  = {0,0,0};
 uint32_t cheekTouchTimes[3] = {0,0,0};
 int      headTouchIdx       = 0;
@@ -446,6 +457,23 @@ bool isRapidArr(uint32_t arr[3], uint32_t now) {
 void handleTouch() {
   bool h = digitalRead(PIN_TOUCH_HEAD)  == HIGH;
   bool c = digitalRead(PIN_TOUCH_CHEEK) == HIGH;
+
+  // En ENOJADO: cabeza y mejilla cuentan como caricias para calmar. N total.
+  if (currentState == S_ANGRY) {
+    bool got = false;
+    if (h && !prevHead)  { angryCalmCount++; got = true; }
+    if (c && !prevCheek) { angryCalmCount++; got = true; }
+    if (got) {
+      Serial.printf("[angry] caricia %d/%d\n", angryCalmCount, ANGRY_CALM_TOUCHES);
+      if (angryCalmCount >= ANGRY_CALM_TOUCHES) {
+        angryCalmCount = 0;
+        setState(S_LOVE);
+        changeMood(MOOD_LOVE_GAIN);
+      }
+    }
+    prevHead = h; prevCheek = c;
+    return;
+  }
 
   if (h && !prevHead) {
     uint32_t now = millis();
@@ -479,6 +507,7 @@ void handleTouch() {
       setState(S_FED_UP);
       cheekTouchTimes[0] = cheekTouchTimes[1] = cheekTouchTimes[2] = 0;
     } else if (currentState == S_RAGE) {
+      // Una caricia gentil durante la calavera la calma a LOVE.
       setState(S_LOVE);
       changeMood(MOOD_LOVE_GAIN);
     } else {
@@ -708,6 +737,12 @@ void applyStateDynamics(EyeShape& e, uint32_t t) {
       e.xOffset = (int)(sinf((float)t * 0.040f) * 4.0f * fade);
       break;
     }
+    case S_ANGRY: {
+      // Solo mirada natural lado a lado (sin squeeze/parpadeo sinusoidal).
+      e.xOffset += lookOffX;
+      e.yOffset += lookOffY;
+      break;
+    }
     case S_LOVE: {
       // Latido lub-dub: dos pulsos rapidos + reposo. Crece hasta +30%.
       uint32_t cyc = t % 1000;
@@ -771,7 +806,7 @@ void drawSadFace(uint32_t t) {
   }
 }
 
-// ── RAGE ──
+// ── CALAVERA (S_RAGE) ──
 void drawRageFace(uint32_t t) {
   int shakeX = (int)(sinf((float)t * 0.060f) * 5.0f);
   int shakeY = (int)(cosf((float)t * 0.075f) * 3.0f);
@@ -843,8 +878,7 @@ void drawShape(const EyeShape& s) {
     bool inIdleSettled = (currentState == S_IDLE && transitionDone());
     bool styleHappy    = inIdleSettled && moodLevel >= 60;
     bool styleSad      = inIdleSettled && moodLevel < 30;
-    bool styleBored    = inIdleSettled && moodLevel >= 30 && currentIdleMood == IDLE_BORED;
-    bool styleThinking = inIdleSettled && moodLevel >= 30 && currentIdleMood == IDLE_THINKING;
+    bool styleBored    = inIdleSettled && moodLevel >= 30 && moodLevel < 60 && currentIdleMood == IDLE_BORED;
 
     if (s.slope > 0) {
       drawAnnoyedEyeV2(xL, yT, s.rectW, s.rectH, s.slope, true,  s.color);
@@ -855,9 +889,6 @@ void drawShape(const EyeShape& s) {
     } else if (styleBored) {
       drawBoredEye(xL, yT, s.rectW, s.rectH, s.color);
       drawBoredEye(xR, yT, s.rectW, s.rectH, s.color);
-    } else if (styleThinking) {
-      drawThinkingEye(xL, yT, s.rectW, s.rectH, s.color);
-      drawThinkingEye(xR, yT, s.rectW, s.rectH, s.color);
     } else if (styleHappy) {
       drawHappyEye(xL, yT, s.rectW, s.rectH, true,  s.color);
       drawHappyEye(xR, yT, s.rectW, s.rectH, false, s.color);
